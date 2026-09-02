@@ -161,10 +161,28 @@ def main() -> int:
 
 
 def _run(args, repo, target):
-    files = [f for f in git(["show", "--name-only", "--format=", target], repo).split("\n") if f]
+    # -z, because without it git QUOTES any path outside ASCII: `src/modèle.py` comes back
+    # as the literal 12-character-escaped string "src/mod\303\250le.py". That string names
+    # no file, so the revert silently did nothing and a correct fix with a correct test was
+    # reported DOES NOT DISCRIMINATE -- a false negative that tells you a good test is
+    # worthless. Measured 2026-09-02. Paths with spaces were never affected; accents are.
+    files = [f for f in git(["show", "--name-only", "--format=", "-z", target],
+                            repo).split("\0") if f]
     src, tests = classify(files)
     if args.source:
         src = args.source
+        # A --source path is used to unlink and rewrite files. One that escapes the repo
+        # would do that to something the user never pointed this at, and a run killed
+        # between the unlink and the restore loses it outright.
+        root = Path(repo).resolve()
+        outside = [f for f in src
+                   if not str((root / f).resolve()).startswith(str(root) + "/")]
+        if outside:
+            print("REFUSED: --source must stay inside the repository; these escape it:",
+                  file=sys.stderr)
+            for f in outside:
+                print(f"    {f}", file=sys.stderr)
+            return 2
     if not src:
         print(f"REFUSED: {target[:8]} touches no source files "
               f"({len(tests)} test file(s)) -- nothing to revert, so there is no "
@@ -173,7 +191,7 @@ def _run(args, repo, target):
 
     # A throwaway worktree is clean by construction and holds nothing of the user's.
     dirty = [] if args.worktree else [
-        ln[3:] for ln in git(["status", "--porcelain"], repo).split("\n") if ln]
+        ln[3:] for ln in git(["status", "--porcelain", "-z"], repo).split("\0") if ln]
     clash = sorted(set(dirty) & set(src))
     if clash:
         print("REFUSED: uncommitted changes in the files this would revert; commit or "

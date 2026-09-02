@@ -129,5 +129,44 @@ check("a source-clobbering test leaves the tree intact",
 shutil.rmtree(r, ignore_errors=True)
 
 
+
+# --- round 2 --------------------------------------------------------------------------
+
+# 8. Without -z, git QUOTES any path outside ASCII: `src/mod\u00e8le.py` comes back as the
+#    literal escaped string "src/mod\\303\\250le.py", which names no file. The revert
+#    silently did nothing and a correct fix with a correct test was reported DOES NOT
+#    DISCRIMINATE -- a false negative telling you a good test is worthless. Paths with
+#    spaces were never affected; accents are, which for a French-language repo is routine.
+r = pathlib.Path(tempfile.mkdtemp())
+(r / "src").mkdir(); (r / "tests").mkdir()
+g = lambda *a: subprocess.run(["git", "-C", str(r), *a], capture_output=True)
+g("init", "-q", "."); g("config", "user.email", "t@t"); g("config", "user.name", "t")
+acc = "src/mod\u00e8le.py"
+(r / acc).write_text("def add(a,b):\n    return a - b\n")
+(r / "tests/test_m.py").write_text(
+    "import os, importlib.util\n"
+    "def test_add():\n"
+    "    p = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), %r)\n"
+    "    spec = importlib.util.spec_from_file_location('m', p)\n"
+    "    m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
+    "    assert m.add(2,3) == 5\n" % acc)
+g("add", "-A"); g("commit", "-qm", "before")
+(r / acc).write_text("def add(a,b):\n    return a + b\n")
+g("add", "-A"); g("commit", "-qm", "after")
+check("a non-ASCII path is reverted, not skipped", run_rf(r), 0)
+shutil.rmtree(r, ignore_errors=True)
+
+# 9. A --source path is used to unlink and rewrite files. One that escapes the repo would do
+#    that to something the user never pointed this at, and a run killed between the unlink
+#    and the restore loses it outright.
+r = mkrepo("def add(a,b):\n    return a - b\n", "def add(a,b):\n    return a + b\n", TEST)
+esc = subprocess.run([sys.executable, str(RF), "HEAD", "--test", CMD, "--repo", str(r),
+                      "--source", "../" * 12 + "tmp/x"], capture_output=True, text=True)
+check("--source escaping the repo is refused", esc.returncode, 2)
+inside = subprocess.run([sys.executable, str(RF), "HEAD", "--test", CMD, "--repo", str(r),
+                         "--source", "src/m.py"], capture_output=True, text=True)
+check("--source inside the repo still works", inside.returncode, 0)
+shutil.rmtree(r, ignore_errors=True)
+
 print(f"\n{'ALL PASS' if not FAILS else str(len(FAILS)) + ' FAILED: ' + ', '.join(FAILS)}")
 sys.exit(0 if not FAILS else 1)

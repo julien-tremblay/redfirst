@@ -66,6 +66,8 @@ Works with any test runner: it just runs the shell command you give it.
 
 ## Safety
 
+- **`--source` may not escape the repository.** Those paths are used to unlink and rewrite
+  files, and a run killed between the two loses whatever they named.
 - **It refuses to run on a dirty tree** when your uncommitted changes overlap the files it
   would revert, so an interrupted run cannot lose work.
 - **It restores the exact bytes it found**, not the commit's version. Restoring with
