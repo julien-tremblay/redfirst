@@ -41,8 +41,18 @@ redfirst <older-commit> --worktree --test "pytest -q"
 This matters. On a fixture where a commit shipped a tautological test and a *later* commit
 added the negative case it should have had, the in-place run credited the later test to the
 earlier commit and reported DISCRIMINATES. With `--worktree` the same commit correctly
-reports DOES NOT DISCRIMINATE. Your suite must not depend on untracked files (a virtualenv,
-`node_modules`, a `.env`) for worktree mode to work.
+reports DOES NOT DISCRIMINATE.
+
+Worktree mode checks out tracked files only, so an editable install (`pip install -e .`)
+still points at your original checkout and the package will not import. The test command
+runs with the worktree as its working directory, so a relative path fixes it:
+
+```
+redfirst <commit> --worktree --test "PYTHONPATH=src python3 -m pytest tests/test_x.py -q"
+```
+
+The same applies to anything else your suite needs that git does not track: a virtualenv,
+`node_modules`, a `.env`.
 
 ## Why this and not coverage
 
