@@ -1,0 +1,23 @@
+name: tests
+on: [push, pull_request]
+
+jobs:
+  tests:
+    # The suite builds throwaway git repositories and runs pytest inside them, so it needs
+    # git configured and pytest available. It makes no network calls.
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: pip install pytest
+      - name: git identity for the fixture repositories
+        run: |
+          git config --global user.email ci@example.invalid
+          git config --global user.name CI
+          git config --global init.defaultBranch main
+      - run: python3 tests/test_redfirst.py
