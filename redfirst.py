@@ -42,6 +42,7 @@ import argparse
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 
@@ -103,20 +104,76 @@ def main() -> int:
     ap.add_argument("--source", action="append", default=None,
                     help="explicit source path to revert (repeatable); "
                          "default: every non-test file the commit touched")
+    ap.add_argument("--worktree", action="store_true",
+                    help="check the commit out into a throwaway git worktree and run "
+                         "there. Required for any commit that is not HEAD. Slower, and "
+                         "your suite must not depend on untracked files (a venv, "
+                         "node_modules, a .env).")
     args = ap.parse_args()
     repo = args.repo
 
-    files = [f for f in git(["show", "--name-only", "--format=", args.commit], repo).split("\n") if f]
+    head = git(["rev-parse", "HEAD"], repo).strip()
+    rev = subprocess.run(["git", "-C", repo, "rev-parse", "--verify", "--quiet",
+                          args.commit + "^{commit}"], capture_output=True, text=True)
+    if rev.returncode != 0:
+        print(f"REFUSED: {args.commit!r} is not a commit in {repo}.", file=sys.stderr)
+        return 2
+    target = rev.stdout.strip()
+    nparents = len(git(["rev-list", "--parents", "-n", "1", target], repo).split()) - 1
+    if nparents == 0:
+        print(f"REFUSED: {args.commit} is the root commit -- it has no parent, so there "
+              f"is no old code to discriminate against.", file=sys.stderr)
+        return 2
+    if nparents > 1:
+        print(f"REFUSED: {args.commit} is a merge commit. `git show` reports no files for "
+              f"a merge, so there is nothing to revert. Check the individual commits on "
+              f"the branch instead.", file=sys.stderr)
+        return 2
+
+    # THE TESTS COME FROM THE WORKING TREE, NOT FROM THE COMMIT. In place, this tool only
+    # rewinds the SOURCE files; whatever the tree currently holds is what runs. For HEAD
+    # that is exactly right. For any older commit it is a different experiment than the one
+    # reported, and it gives WRONG ANSWERS: measured 2026-09-02 on a fixture where a commit
+    # shipped a tautological test and a LATER commit added the missing negative case, this
+    # printed "DISCRIMINATES: it tests the change" about a test that, as written at that
+    # commit, passed against its own parent. A false green on the only question it asks.
+    if target != head and not args.worktree:
+        print(f"REFUSED: {args.commit} is not HEAD ({head[:8]}). In place, the tests that\n"
+              f"run are the ones in your working tree TODAY, not the ones this commit\n"
+              f"shipped, so a later commit that strengthened the test would be credited to\n"
+              f"this one. Re-run with --worktree to check the commit as it actually was.",
+              file=sys.stderr)
+        return 2
+
+    origin = repo
+    tmp = None
+    if args.worktree:
+        tmp = tempfile.mkdtemp(prefix="redfirst-")
+        wt = str(Path(tmp) / "wt")
+        git(["worktree", "add", "--detach", "--quiet", wt, target], origin)
+        repo = wt
+    try:
+        return _run(args, repo, target)
+    finally:
+        if tmp:
+            git(["worktree", "remove", "--force", str(Path(tmp) / "wt")], origin, check=False)
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _run(args, repo, target):
+    files = [f for f in git(["show", "--name-only", "--format=", target], repo).split("\n") if f]
     src, tests = classify(files)
     if args.source:
         src = args.source
     if not src:
-        print(f"REFUSED: {args.commit} touches no source files "
+        print(f"REFUSED: {target[:8]} touches no source files "
               f"({len(tests)} test file(s)) -- nothing to revert, so there is no "
               f"old code to discriminate against.", file=sys.stderr)
         return 2
 
-    dirty = [ln[3:] for ln in git(["status", "--porcelain"], repo).split("\n") if ln]
+    # A throwaway worktree is clean by construction and holds nothing of the user's.
+    dirty = [] if args.worktree else [
+        ln[3:] for ln in git(["status", "--porcelain"], repo).split("\n") if ln]
     clash = sorted(set(dirty) & set(src))
     if clash:
         print("REFUSED: uncommitted changes in the files this would revert; commit or "
@@ -125,34 +182,53 @@ def main() -> int:
             print(f"    {c}", file=sys.stderr)
         return 2
 
-    print(f"commit   {args.commit}")
+    # Snapshot the exact bytes on disk BEFORE anything runs, and restore THOSE. Restoring
+    # with `git checkout <commit> -- src` was wrong and corrupted the working tree the first
+    # time this tool was run in anger: for any commit that is not HEAD it puts the file back
+    # at THAT COMMIT's content, silently reverting whatever the tree actually had. It did
+    # exactly that to scripts/guard-secret-leak.py, undoing a fix committed an hour earlier.
+    # A checker that damages the tree it is auditing is worse than no checker.
+    # Taken before the BASELINE and not after it: a --test command that rewrites source (a
+    # formatter in the suite) would otherwise be snapshotted in its rewritten state and
+    # "restored" to it, under a message promising the pre-run contents.
+    snapshot = {}
+    for f in src:
+        fp = Path(repo) / f
+        snapshot[f] = fp.read_bytes() if fp.exists() else None
+
+    print(f"commit   {target[:8]}")
     print(f"source   {', '.join(src)}")
     print(f"tests    {', '.join(tests) or '(none in this commit)'}")
     print(f"running  {args.test}\n")
 
     before = subprocess.run(args.test, shell=True, cwd=repo)
     if before.returncode != 0:
-        print(f"\nREFUSED: the test command already fails at {args.commit} "
+        print(f"\nREFUSED: the test command already fails at {target[:8]} "
               f"(exit {before.returncode}). Fix that first -- a check that starts red "
               f"cannot tell you anything about the old code.", file=sys.stderr)
         return 2
     print("\n  baseline: test passes at this commit, as expected.\n")
 
-    # Snapshot the exact bytes on disk, and restore THOSE. Restoring with
-    # `git checkout <commit> -- src` was wrong and corrupted the working tree the first
-    # time this tool was run in anger: for any commit that is not HEAD it puts the file
-    # back at THAT COMMIT's content, silently reverting whatever the tree actually had.
-    # It did exactly that to scripts/guard-secret-leak.py, undoing a fix committed an hour
-    # earlier. A checker that damages the tree it is auditing is worse than no checker.
-    parent = f"{args.commit}^"
-    snapshot = {}
-    for f in src:
-        fp = Path(repo) / f
-        snapshot[f] = fp.read_bytes() if fp.exists() else None
+    parent = f"{target}^"
+    # A file the commit ADDED does not exist in the parent, and `git checkout <parent> -- <new>`
+    # fails outright -- it does not partially apply -- so the whole run died with a raw
+    # "pathspec did not match" and exit 2. That made the most ordinary shape of all
+    # uncheckable: a new module plus its first test. The parent's state for such a file is
+    # its ABSENCE, so delete it.
+    in_parent = [f for f in src if subprocess.run(
+        ["git", "-C", repo, "cat-file", "-e", f"{parent}:{f}"],
+        capture_output=True).returncode == 0]
+    added = [f for f in src if f not in in_parent]
     try:
-        git(["checkout", parent, "--", *src], repo)
+        if in_parent:
+            git(["checkout", parent, "--", *in_parent], repo)
+        for f in added:
+            (Path(repo) / f).unlink(missing_ok=True)
         _drop_stale_bytecode(repo, src)
-        print(f"  reverted source to {parent}; re-running the SAME test...\n")
+        detail = f"{len(in_parent)} reverted"
+        if added:
+            detail += f", {len(added)} deleted (added by this commit)"
+        print(f"  source at parent {parent[:8]}^ ({detail}); re-running the SAME test...\n")
         after = subprocess.run(args.test, shell=True, cwd=repo)
     finally:
         for f, blob in snapshot.items():
@@ -166,11 +242,11 @@ def main() -> int:
         print("\n  source restored to its exact pre-run contents.")
 
     if after.returncode != 0:
-        print(f"\nDISCRIMINATES: the test went RED against {parent} "
+        print(f"\nDISCRIMINATES: the test went RED against {target[:8]}^ "
               f"(exit {after.returncode}) and passes with the change. It tests the change.")
         return 0
     print(f"\nDOES NOT DISCRIMINATE: the test passes BOTH with and without the change.\n"
-          f"It proves nothing about {args.commit}. Either it exercises a code path the\n"
+          f"It proves nothing about {target[:8]}. Either it exercises a code path the\n"
           f"change did not alter, or -- the common case -- it pins the implementation\n"
           f"rather than the threat: the setup replaced the very state the bug lives in.")
     return 1

@@ -27,6 +27,23 @@ DISCRIMINATES: the test went RED against HEAD^ (exit 1) and passes with the chan
 Exit `0` discriminates, `1` does not, `2` could not run the check. Drop it in CI or a
 pre-push hook.
 
+## Auditing an older commit
+
+In place, `redfirst` rewinds only the **source** files, so the tests that run are the ones
+in your working tree today. For `HEAD` that is exactly right. For any older commit it is a
+different experiment than the one reported, so it refuses, and `--worktree` checks the
+commit out into a throwaway git worktree instead:
+
+```
+redfirst <older-commit> --worktree --test "pytest -q"
+```
+
+This matters. On a fixture where a commit shipped a tautological test and a *later* commit
+added the negative case it should have had, the in-place run credited the later test to the
+earlier commit and reported DISCRIMINATES. With `--worktree` the same commit correctly
+reports DOES NOT DISCRIMINATE. Your suite must not depend on untracked files (a virtualenv,
+`node_modules`, a `.env`) for worktree mode to work.
+
 ## Why this and not coverage
 
 Coverage tells you a line executed. It does not tell you the test would have noticed if the
@@ -55,6 +72,15 @@ Works with any test runner: it just runs the shell command you give it.
   `git checkout <commit> -- src` was the first implementation and it corrupted a working
   tree in real use, silently undoing a fix committed an hour earlier.
 - **It never reverts test files.** New tests against old source is the entire trick.
+- **It handles a commit that adds a new file.** The parent's state for such a file is its
+  absence, so it is deleted rather than checked out. `git checkout <parent> -- <new file>`
+  fails outright, which used to make the most ordinary commit of all (a new module plus its
+  first test) impossible to check.
+- **It snapshots before anything runs**, so a `--test` command that rewrites source (a
+  formatter inside the suite) is still restored to what you actually had.
+- **It refuses what it cannot answer**: a merge commit (`git show` reports no files for
+  one), a root commit (no parent to revert to), and an unknown revision each exit 2 with a
+  specific reason rather than a verdict or a raw git error.
 - **It clears compiled bytecode between runs.** CPython validates a `.pyc` by source mtime
   in whole seconds plus size, so a same-size edit reverted and re-run inside one second
   reuses stale bytecode. Without this the tool reported a correct test as proving nothing.
