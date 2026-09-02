@@ -111,11 +111,55 @@ A green result means *this test is about this change*. It does not mean *this ch
 correct*. For that, enumerate the set that currently satisfies the check and ask whether it
 is the intended set.
 
+## How much of your history can it actually speak to
+
+Less than you would hope, and the number is worth knowing before you adopt it.
+
+`redfirst` needs a commit that changes source **and** ships a test. Across five repositories
+and 221 code commits, 25 did: **11%**.
+
+| Repository | code commits | with tests |
+|---|---|---|
+| A | 40 | 10 (25%) |
+| B | 57 | 7 (12%) |
+| C | 18 | 3 (17%) |
+| D | 38 | 3 (8%) |
+| E | 68 | 2 (3%) |
+
+That is one sample of one developer's habits and it may say more about the sample than about
+software. But it bounds the tool honestly: on this history, eight commits in nine are
+outside what it can answer, and no amount of improvement to the tool changes that. If your
+ratio is different, that is genuinely useful to know.
+
+On the 3 commits from that sample that were actually checked, all three correctly reported
+DISCRIMINATES. No defects found. A small sample, and the deflating half of the result.
+
+## What I would like you to break
+
+1. **A commit where the verdict is wrong**, in either direction. The quieter and more
+   damaging one is a false **DOES NOT DISCRIMINATE**, because it tells you a good test is
+   worthless. One shipped: a non-ASCII filename made `git show` quote the path, so the
+   revert silently did nothing and a correct fix read as untested.
+2. **Tell me the blind spot is bigger than documented.** See below. I do not know how much
+   of the useful space is left once you exclude tests that discriminate while aiming at the
+   wrong thing.
+3. **Tell me the 11% is unrepresentative.** If commits in your repository routinely pair
+   source with tests, the ceiling above is wrong and the tool is more useful than I think.
+4. **`--worktree` in a setup I have not seen.** It checks out tracked files only, so
+   editable installs, virtualenvs and `node_modules` are absent. The workaround above covers
+   the case I hit. There will be others.
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md).
+
 ## Tests
 
 ```
+pip install pytest
 python3 tests/test_redfirst.py
 ```
+
+Offline, about twenty seconds. Every case is a defect that actually shipped. This is what CI
+runs on every push, on Python 3.9 and 3.12.
 
 ## License
 
