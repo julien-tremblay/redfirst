@@ -13,7 +13,7 @@ command with a yes/no answer, which is why it transfers to a cheap model, or to 
 
   redfirst <commit> --test "pytest path/to/test_x.py -q"
   redfirst <commit> --test "..." -k some_test_name
-  the pre-fork name HEAD --test "..." --repo ~/ai
+  redfirst HEAD --test "..." --repo /path/to/other/repo
 
 Exit 0 = DISCRIMINATES (test went red against the old source). Exit 1 = it did not, which
 means the test proves nothing about this change. Exit 2 = could not run the check.
