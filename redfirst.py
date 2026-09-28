@@ -351,6 +351,10 @@ def _run(args, repo, target, sub):
     print(f"tests    {', '.join(tests) or '(none in this commit)'}")
     print(f"running  {args.test}\n")
 
+    # Flushed before every run: piped, as in any CI log, stdout is block-buffered while the
+    # test writes straight to the descriptor, and both runs' output landed above the header
+    # that says which run is which. Measured 2026-09-28.
+    sys.stdout.flush()
     before = subprocess.run(args.test, shell=True, cwd=cwd)
     if before.returncode != 0:
         print(f"\nREFUSED: the test command already fails at {target[:8]} "
@@ -384,6 +388,7 @@ def _run(args, repo, target, sub):
         if added:
             detail += f", {len(added)} deleted (added by this commit)"
         print(f"  source at parent {parent[:8]}^ ({detail}); re-running the SAME test...\n")
+        sys.stdout.flush()
         after = subprocess.run(args.test, shell=True, cwd=cwd)
     finally:
         for f, saved in snapshot.items():

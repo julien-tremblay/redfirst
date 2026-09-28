@@ -367,5 +367,18 @@ else:
     check("a crash exits 2, not the DOES NOT DISCRIMINATE code", run_rf(r), 2)
 shutil.rmtree(r, ignore_errors=True)
 
+# 23. Piped -- as in every CI log -- stdout is block-buffered, but the test command writes
+#     straight to the descriptor. Both runs' output landed ABOVE redfirst's own header, so the
+#     log could not say which run was the baseline and which the reverted one.
+r = mkrepo("def add(a,b):\n    return a - b\n", "def add(a,b):\n    return a + b\n", TEST)
+env = {k: v for k, v in os.environ.items() if k != "PYTHONUNBUFFERED"}
+out = subprocess.run([sys.executable, str(RF), "HEAD", "--test", CMD, "--repo", str(r)],
+                     capture_output=True, text=True, env=env).stdout.splitlines()
+first = lambda pred: next((i for i, l in enumerate(out) if pred(l)), len(out))
+check("in a CI log, each run's output follows the line that announces it",
+      int(first(lambda l: l.startswith("running")) < first(lambda l: "passed" in l)
+          < first(lambda l: "re-running" in l) < first(lambda l: "failed" in l)), 1)
+shutil.rmtree(r, ignore_errors=True)
+
 print(f"\n{'ALL PASS' if not FAILS else str(len(FAILS)) + ' FAILED: ' + ', '.join(FAILS)}")
 sys.exit(0 if not FAILS else 1)
