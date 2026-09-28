@@ -271,5 +271,33 @@ wrong = [p for p in TESTS if rfmod.classify([p])[0]] + [p for p in SOURCE if rfm
 check("test conventions classify as tests, source as source" + (f" -- wrong: {wrong}" if wrong else ""),
       len(wrong), 0)
 
+# 17. --repo (default: cwd) was assumed to be the top of the repository. Git reports paths from
+#     the top, so from a subdirectory -- a service folder in a monorepo -- every file operation
+#     pointed below it at nothing. A commit adding a new module was "reverted" by deleting a
+#     file that did not exist, the test still passed, and a good test read as worthless.
+r = pathlib.Path(tempfile.mkdtemp())
+gitq(r, "init", "-q", "."); gitq(r, "config", "user.email", "t@t"); gitq(r, "config", "user.name", "t")
+(r / "svc/src").mkdir(parents=True); (r / "svc/tests").mkdir()
+(r / "svc/src/m.py").write_text("def add(a,b):\n    return a + b\n")
+(r / "svc/tests/test_m.py").write_text(TEST)
+gitq(r, "add", "-A"); gitq(r, "commit", "-qm", "svc")
+(r / "svc/src/new.py").write_text("def mul(a,b):\n    return a * b\n")
+(r / "svc/tests/test_new.py").write_text("from src.new import mul\ndef test_mul():\n    assert mul(3,4)==12\n")
+gitq(r, "add", "-A"); gitq(r, "commit", "-qm", "feat: new module")
+for extra in ([], ["--worktree"]):
+    got = subprocess.run([sys.executable, str(RF), "HEAD", "--test", "python3 -m pytest tests/test_new.py -q",
+                          "--repo", str(r / "svc"), *extra], capture_output=True, text=True).returncode
+    check("from a subdirectory" + (" with --worktree" if extra else "") + ", a new module is reverted", got, 0)
+shutil.rmtree(r, ignore_errors=True)
+
+# 18. --source was compared with `git status` output as typed, so `./src/m.py` never matched
+#     `src/m.py` and uncommitted work in it walked straight past the dirty-tree refusal.
+r = mkrepo("def add(a,b):\n    return a - b\n", "def add(a,b):\n    return a + b\n", TEST)
+(r / "src/m.py").write_text("def add(a,b):\n    return a + b  # uncommitted\n")
+got = subprocess.run([sys.executable, str(RF), "HEAD", "--test", CMD, "--repo", str(r),
+                      "--source", "./src/m.py"], capture_output=True, text=True).returncode
+check("--source ./path with uncommitted work is refused", got, 2)
+shutil.rmtree(r, ignore_errors=True)
+
 print(f"\n{'ALL PASS' if not FAILS else str(len(FAILS)) + ' FAILED: ' + ', '.join(FAILS)}")
 sys.exit(0 if not FAILS else 1)

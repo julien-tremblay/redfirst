@@ -39,6 +39,7 @@ leave old source in place.
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import shutil
 import subprocess
@@ -117,9 +118,11 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("commit", help="the commit whose test/source pair is being checked")
     ap.add_argument("--test", required=True, help="command that runs the test(s)")
-    ap.add_argument("--repo", default=".", help="repository root (default: cwd)")
+    ap.add_argument("--repo", default=".",
+                    help="where to run the test command: the repository or any directory "
+                         "inside it (default: cwd)")
     ap.add_argument("--source", action="append", default=None,
-                    help="explicit source path to revert (repeatable); "
+                    help="explicit source path to revert, relative to --repo (repeatable); "
                          "default: every non-test file the commit touched")
     ap.add_argument("--worktree", action="store_true",
                     help="check the commit out into a throwaway git worktree and run "
@@ -127,7 +130,19 @@ def main() -> int:
                          "your suite must not depend on untracked files (a venv, "
                          "node_modules, a .env).")
     args = ap.parse_args()
-    repo = args.repo
+    # --repo may be any directory inside the repository; a service's own folder in a monorepo
+    # is the ordinary case. Git reports paths from the TOP, so every file operation happens
+    # there and only the test command runs where the user asked. Taking --repo as the top
+    # made `Path(repo) / path` point below the subdirectory at nothing: a commit adding a new
+    # module was "reverted" by deleting a file that did not exist, the test still passed, and
+    # a good test was reported DOES NOT DISCRIMINATE. Measured 2026-09-28.
+    repo = git(["rev-parse", "--show-toplevel"], args.repo).strip()
+    sub = git(["rev-parse", "--show-prefix"], args.repo).strip()
+    if args.source:
+        # Relative to --repo, as a git pathspec would be, and normalised to the top so that
+        # `./src/m.py` names the same file `git status` does.
+        args.source = [Path(os.path.relpath(os.path.join(repo, sub, f), repo)).as_posix()
+                       for f in args.source]
 
     head = git(["rev-parse", "HEAD"], repo).strip()
     rev = subprocess.run(["git", "-C", repo, "rev-parse", "--verify", "--quiet",
@@ -170,14 +185,19 @@ def main() -> int:
         git(["worktree", "add", "--detach", "--quiet", wt, target], origin)
         repo = wt
     try:
-        return _run(args, repo, target)
+        return _run(args, repo, target, sub)
     finally:
         if tmp:
             git(["worktree", "remove", "--force", str(Path(tmp) / "wt")], origin, check=False)
             shutil.rmtree(tmp, ignore_errors=True)
 
 
-def _run(args, repo, target):
+def _run(args, repo, target, sub):
+    cwd = Path(repo) / sub
+    if not cwd.is_dir():
+        print(f"REFUSED: {sub} does not exist at {target[:8]}, so the test command has "
+              f"nowhere to run.", file=sys.stderr)
+        return 2
     # -z, because without it git QUOTES any path outside ASCII: `src/modèle.py` comes back
     # as the literal 12-character-escaped string "src/mod\303\250le.py". That string names
     # no file, so the revert silently did nothing and a correct fix with a correct test was
@@ -271,7 +291,7 @@ def _run(args, repo, target):
     print(f"tests    {', '.join(tests) or '(none in this commit)'}")
     print(f"running  {args.test}\n")
 
-    before = subprocess.run(args.test, shell=True, cwd=repo)
+    before = subprocess.run(args.test, shell=True, cwd=cwd)
     if before.returncode != 0:
         print(f"\nREFUSED: the test command already fails at {target[:8]} "
               f"(exit {before.returncode}). Fix that first -- a check that starts red "
@@ -299,7 +319,7 @@ def _run(args, repo, target):
         if added:
             detail += f", {len(added)} deleted (added by this commit)"
         print(f"  source at parent {parent[:8]}^ ({detail}); re-running the SAME test...\n")
-        after = subprocess.run(args.test, shell=True, cwd=repo)
+        after = subprocess.run(args.test, shell=True, cwd=cwd)
     finally:
         for f, blob in snapshot.items():
             fp = Path(repo) / f
