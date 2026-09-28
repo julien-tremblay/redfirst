@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """End-to-end tests on throwaway git repositories. Both directions, because a checker
 whose positive and negative cases coincide cannot fail."""
+import importlib.util
+import os
 import pathlib
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 RF = ROOT / "redfirst.py"
@@ -43,6 +47,21 @@ def run_rf(repo, commit="HEAD"):
                           capture_output=True, text=True).returncode
 
 
+def refused(name, repo, commit, why):
+    """A refusal is exit 2 AND the reason. Exit 2 alone is also what any run gets when the
+    baseline cannot start, so on a machine without pytest these checks all passed while
+    nothing was being tested."""
+    out = subprocess.run([sys.executable, str(RF), commit, "--test", CMD, "--repo", str(repo)],
+                         capture_output=True, text=True)
+    check(name, int(out.returncode == 2 and why in out.stderr), 1)
+
+
+# Every fixture runs pytest. Without it the baseline fails, every run exits 2, and each check
+# expecting 2 passed: 7 of 13 "passed" on a machine with no pytest. Stop instead.
+if subprocess.run("python3 -m pytest --version", shell=True, capture_output=True).returncode:
+    sys.exit("The fixture repositories run pytest under `python3`: pip install pytest")
+
+
 # 1. A real fix with a real test MUST discriminate. This failed before the stale-bytecode
 #    fix: `a - b` and `a + b` are the same size, the revert and re-run land in the same
 #    whole second, and CPython reused the .pyc, so the reverted source never ran.
@@ -59,7 +78,7 @@ shutil.rmtree(r, ignore_errors=True)
 
 # 3. A bad commit ref cannot be reported as a verdict.
 r = mkrepo("def add(a,b):\n    return a + b\n", "def add(a,b):\n    return a + b\n", SMOKE)
-check("unknown commit exits 2", run_rf(r, "deadbeefdeadbeef"), 2)
+refused("unknown commit exits 2, saying so", r, "deadbeefdeadbeef", "is not a commit")
 shutil.rmtree(r, ignore_errors=True)
 
 
@@ -96,7 +115,7 @@ target = gitq(r, "rev-parse", "HEAD").stdout.strip()
     "def test_yes():\n    assert is_admin({'role':'admin'}) is True\n"
     "def test_no():\n    assert is_admin({'role':'guest'}) is False\n")
 gitq(r, "add", "-A"); gitq(r, "commit", "-qm", "test: the negative case nobody wrote")
-check("non-HEAD commit is refused in place", run_rf(r, target), 2)
+refused("non-HEAD commit is refused in place, saying so", r, target, "is not HEAD")
 got = subprocess.run([sys.executable, str(RF), target, "--worktree", "--test", CMD,
                       "--repo", str(r)], capture_output=True, text=True).returncode
 check("--worktree gives the TRUE verdict on that commit", got, 1)
@@ -105,7 +124,7 @@ shutil.rmtree(r, ignore_errors=True)
 # 6. Structural refusals must be specific, not a generic "no source files".
 r = mkrepo("def add(a,b):\n    return a + b\n", "def add(a,b):\n    return a + b\n", SMOKE)
 root = gitq(r, "rev-list", "--max-parents=0", "HEAD").stdout.split()[0]
-check("root commit is refused", run_rf(r, root), 2)
+refused("root commit is refused, saying so", r, root, "root commit")
 gitq(r, "checkout", "-q", "-b", "side", root)
 (r / "side.txt").write_text("x"); gitq(r, "add", "-A"); gitq(r, "commit", "-qm", "side")
 gitq(r, "checkout", "-q", "-")
@@ -162,7 +181,8 @@ shutil.rmtree(r, ignore_errors=True)
 r = mkrepo("def add(a,b):\n    return a - b\n", "def add(a,b):\n    return a + b\n", TEST)
 esc = subprocess.run([sys.executable, str(RF), "HEAD", "--test", CMD, "--repo", str(r),
                       "--source", "../" * 12 + "tmp/x"], capture_output=True, text=True)
-check("--source escaping the repo is refused", esc.returncode, 2)
+check("--source escaping the repo is refused, saying so",
+      int(esc.returncode == 2 and "must stay inside" in esc.stderr), 1)
 inside = subprocess.run([sys.executable, str(RF), "HEAD", "--test", CMD, "--repo", str(r),
                          "--source", "src/m.py"], capture_output=True, text=True)
 check("--source inside the repo still works", inside.returncode, 0)
@@ -260,7 +280,6 @@ shutil.rmtree(r, ignore_errors=True)
 
 # 16. Misfiling a test as source reverts it and destroys the check, so every common runner's
 #     convention must land on the TEST side -- and ordinary source must not.
-import importlib.util
 spec = importlib.util.spec_from_file_location("redfirst_under_test", RF)
 rfmod = importlib.util.module_from_spec(spec); spec.loader.exec_module(rfmod)
 TESTS = ["src/parser.spec.ts", "src/__tests__/parser.js", "test/parser.js", "lib/foo_spec.rb",
@@ -315,7 +334,6 @@ shutil.rmtree(r, ignore_errors=True)
 #     And `git checkout <parent> -- src` had STAGED it, so the next `git commit` would ship
 #     the revert. SIGTERM must unwind through the restore; SIGKILL cannot be caught, but must
 #     still leave nothing in the index.
-import signal, time
 def interrupted(sig):
     r = mkrepo("def add(a,b):\n    return a - b\n", "def add(a,b):\n    return a + b\n", TEST)
     p = subprocess.Popen([sys.executable, str(RF), "HEAD", "--repo", str(r), "--test",
@@ -344,7 +362,7 @@ r = mkrepo("def add(a,b):\n    return a - b\n", "def add(a,b):\n    return a + b
 (r / "run.sh").write_text("#!/bin/sh\necho run\n"); (r / "run.sh").chmod(0o755)
 (r / "tool.sh").write_text("#!/bin/sh\n"); (r / "tool.sh").chmod(0o755)
 (r / "src/m.py").write_text("def add(a,b):\n    return a + b + 0\n")
-import os; os.symlink("../generated/cfg.py", r / "src/cfg.py")
+os.symlink("../generated/cfg.py", r / "src/cfg.py")
 gitq(r, "add", "-A"); gitq(r, "commit", "-qm", "modes and links")
 run_rf(r)
 left = gitq(r, "status", "--porcelain", "--untracked-files=no").stdout.split("\n")
