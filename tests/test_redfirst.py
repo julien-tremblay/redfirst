@@ -299,5 +299,16 @@ got = subprocess.run([sys.executable, str(RF), "HEAD", "--test", CMD, "--repo", 
 check("--source ./path with uncommitted work is refused", got, 2)
 shutil.rmtree(r, ignore_errors=True)
 
+# 19. A --source path that is a file in neither the commit nor its parent was taken for one the
+#     commit ADDED and "reverted" by deleting it. A typo reverted nothing, the test passed, and
+#     a good test read as worthless. A directory crashed -- and a crash exits 1, the same verdict.
+r = mkrepo("def add(a,b):\n    return a - b\n", "def add(a,b):\n    return a + b\n", TEST)
+for bad in ("src/mm.py", "src"):
+    out = subprocess.run([sys.executable, str(RF), "HEAD", "--test", CMD, "--repo", str(r),
+                          "--source", bad], capture_output=True, text=True)
+    check(f"--source {bad} (no such file at the commit or its parent) is refused",
+          int(out.returncode == 2 and "REFUSED" in out.stderr), 1)
+shutil.rmtree(r, ignore_errors=True)
+
 print(f"\n{'ALL PASS' if not FAILS else str(len(FAILS)) + ' FAILED: ' + ', '.join(FAILS)}")
 sys.exit(0 if not FAILS else 1)

@@ -56,6 +56,12 @@ def git(args, repo, check=True):
     return r.stdout
 
 
+def _is_file(repo, rev, path):
+    r = subprocess.run(["git", "-C", repo, "cat-file", "-t", f"{rev}:{path}"],
+                       capture_output=True, text=True)
+    return r.stdout.strip() == "blob"
+
+
 def _drop_stale_bytecode(repo, paths):
     """Delete compiled caches for the reverted files.
 
@@ -228,6 +234,18 @@ def _run(args, repo, target, sub):
             print("REFUSED: --source must stay inside the repository; these escape it:",
                   file=sys.stderr)
             for f in outside:
+                print(f"    {f}", file=sys.stderr)
+            return 2
+        # One that is a file in neither the commit nor its parent has nothing to revert. It
+        # was taken for a file the commit ADDED and "reverted" by deleting it, so a typo
+        # reverted nothing, the test passed, and a good test was reported DOES NOT
+        # DISCRIMINATE; a directory crashed, which exits 1 -- the same verdict.
+        unknown = [f for f in src if f not in submodules and not any(
+            _is_file(repo, rev, f) for rev in (target, f"{target}^"))]
+        if unknown:
+            print(f"REFUSED: --source must name a file at {target[:8]} or its parent; "
+                  f"these are neither:", file=sys.stderr)
+            for f in unknown:
                 print(f"    {f}", file=sys.stderr)
             return 2
     moved = [f for f in src if f in submodules]
