@@ -12,7 +12,7 @@ holding the plan answers badly; "does the new test fail without the new source?"
 command with a yes/no answer, which is why it transfers to a cheap model, or to CI.
 
   redfirst <commit> --test "pytest path/to/test_x.py -q"
-  redfirst <commit> --test "..." -k some_test_name
+  redfirst <commit> --test "pytest path/to/test_x.py -q -k some_test_name"
   redfirst HEAD --test "..." --repo /path/to/other/repo
 
 Exit 0 = DISCRIMINATES (test went red against the old source). Exit 1 = it did not, which
