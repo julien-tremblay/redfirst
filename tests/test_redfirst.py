@@ -310,5 +310,30 @@ for bad in ("src/mm.py", "src"):
           int(out.returncode == 2 and "REFUSED" in out.stderr), 1)
 shutil.rmtree(r, ignore_errors=True)
 
+# 20. Interrupted DURING the reverted run. SIGTERM and SIGHUP kill without unwinding, so the
+#     restore never ran: a CI timeout or a closed terminal left the PARENT's source in the tree.
+#     And `git checkout <parent> -- src` had STAGED it, so the next `git commit` would ship
+#     the revert. SIGTERM must unwind through the restore; SIGKILL cannot be caught, but must
+#     still leave nothing in the index.
+import signal, time
+def interrupted(sig):
+    r = mkrepo("def add(a,b):\n    return a - b\n", "def add(a,b):\n    return a + b\n", TEST)
+    p = subprocess.Popen([sys.executable, str(RF), "HEAD", "--repo", str(r), "--test",
+                          CMD + " || (touch reverted.flag; sleep 30)"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    t0 = time.time()
+    while not (r / "reverted.flag").exists() and time.time() - t0 < 30:
+        time.sleep(0.05)
+    p.send_signal(sig); p.wait()
+    return r
+r = interrupted(signal.SIGTERM)
+check("SIGTERM mid-run still restores the source",
+      int("a + b" in (r / "src/m.py").read_text()), 1)
+shutil.rmtree(r, ignore_errors=True)
+r = interrupted(signal.SIGKILL)
+check("SIGKILL mid-run leaves nothing staged",
+      int(gitq(r, "diff", "--cached", "--name-only").stdout.strip() == ""), 1)
+shutil.rmtree(r, ignore_errors=True)
+
 print(f"\n{'ALL PASS' if not FAILS else str(len(FAILS)) + ' FAILED: ' + ', '.join(FAILS)}")
 sys.exit(0 if not FAILS else 1)

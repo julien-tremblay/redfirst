@@ -32,9 +32,11 @@ correct". For that second question the cheap move is enumeration: list the set t
 currently satisfies the check and ask whether it is the intended set. That, not this, is
 what caught 4e03ab5.
 
-Restoration is unconditional; the working tree is checked for modifications to the affected
-paths first and the run is refused if any exist, so an interrupted run can never silently
-leave old source in place.
+Restoration survives Ctrl-C, SIGTERM and SIGHUP: the run unwinds through it. The working
+tree is checked for modifications to the affected paths first and the run is refused if any
+exist, so an interrupted run cannot lose work. Only SIGKILL can leave old source behind, and
+then as an unstaged change that `git status` shows -- the index is never touched -- and that
+the next run refuses to overwrite.
 """
 from __future__ import annotations
 
@@ -42,6 +44,7 @@ import argparse
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -54,6 +57,10 @@ def git(args, repo, check=True):
         print(f"git {' '.join(args)} failed: {r.stderr.strip()}", file=sys.stderr)
         sys.exit(2)
     return r.stdout
+
+
+def _unwind(signum, frame):
+    raise SystemExit(128 + signum)
 
 
 def _is_file(repo, rev, path):
@@ -136,6 +143,13 @@ def main() -> int:
                          "your suite must not depend on untracked files (a venv, "
                          "node_modules, a .env).")
     args = ap.parse_args()
+    # SIGTERM and SIGHUP kill without unwinding, so the `finally` that restores the source
+    # never ran: a CI timeout or a closed terminal during the reverted run left the PARENT's
+    # source in the tree. Measured 2026-09-28. Raise instead, and the restore runs on the way
+    # out.
+    for name in ("SIGTERM", "SIGHUP"):
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), _unwind)
     # --repo may be any directory inside the repository; a service's own folder in a monorepo
     # is the ordinary case. Git reports paths from the TOP, so every file operation happens
     # there and only the test command runs where the user asked. Taking --repo as the top
@@ -329,7 +343,12 @@ def _run(args, repo, target, sub):
     added = [f for f in src if f not in in_parent]
     try:
         if in_parent:
-            git(["checkout", parent, "--", *in_parent], repo)
+            # The WORKING TREE only, never the index. `git checkout <parent> -- src` also
+            # STAGED the parent's source, and the `git restore --staged` that undid it ran only
+            # if the run got that far and every path matched; SIGKILL skipped it outright.
+            # The old source then sat in the index under "source restored", for the next
+            # `git commit` to ship. Measured 2026-09-28.
+            git(["restore", "--source", parent, "--worktree", "--", *in_parent], repo)
         for f in added:
             (Path(repo) / f).unlink(missing_ok=True)
         _drop_stale_bytecode(repo, src)
@@ -346,7 +365,6 @@ def _run(args, repo, target, sub):
             else:
                 fp.parent.mkdir(parents=True, exist_ok=True)
                 fp.write_bytes(blob)
-        git(["restore", "--staged", *src], repo, check=False)
         # And again after. The reverted run compiled the PARENT's source, and the file just
         # restored has the same size and, usually, the same whole-second mtime -- so that
         # bytecode is a valid cache for it and the user's next test run executes the old
