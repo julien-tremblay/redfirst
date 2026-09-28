@@ -246,5 +246,30 @@ check("a commit that moves a submodule is refused, by name",
       int(out.returncode == 2 and "vendor/lib" in out.stderr and "submodule" in out.stderr), 1)
 shutil.rmtree(r, ignore_errors=True); shutil.rmtree(lib, ignore_errors=True)
 
+# 15. A fixture added with the fix lives in conftest.py, which was classified as SOURCE and
+#     reverted: the new test then errored against the parent for want of its fixture, and that
+#     error counted as red -- DISCRIMINATES about a docstring-only change. Test infrastructure
+#     belongs with the tests.
+r = mkrepo("def add(a,b):\n    return a + b\n", "def add(a,b):\n    return a + b\n", SMOKE)
+(r / "src/m.py").write_text('def add(a,b):\n    """doc only"""\n    return a + b\n')
+(r / "conftest.py").write_text("import pytest\n@pytest.fixture\ndef four():\n    return 4\n")
+(r / "tests/test_m.py").write_text("from src.m import add\ndef test_add(four):\n    assert add(2,2)==four\n")
+gitq(r, "add", "-A"); gitq(r, "commit", "-qm", "doc + a fixture-based test")
+check("conftest.py travels with the tests, not the source", run_rf(r), 1)
+shutil.rmtree(r, ignore_errors=True)
+
+# 16. Misfiling a test as source reverts it and destroys the check, so every common runner's
+#     convention must land on the TEST side -- and ordinary source must not.
+import importlib.util
+spec = importlib.util.spec_from_file_location("redfirst_under_test", RF)
+rfmod = importlib.util.module_from_spec(spec); spec.loader.exec_module(rfmod)
+TESTS = ["src/parser.spec.ts", "src/__tests__/parser.js", "test/parser.js", "lib/foo_spec.rb",
+         "src/test/java/FooTest.java", "App.Tests/FooTests.cs", "FooIT.java", "conftest.py",
+         "jest.config.js", "pkg/testdata/in.json", "base/foo_unittest.cc", "tests/test_m.py"]
+SOURCE = ["src/latest.py", "src/Contest.java", "src/attestation.py", "AUDIT.md", "src/m.py"]
+wrong = [p for p in TESTS if rfmod.classify([p])[0]] + [p for p in SOURCE if rfmod.classify([p])[1]]
+check("test conventions classify as tests, source as source" + (f" -- wrong: {wrong}" if wrong else ""),
+      len(wrong), 0)
+
 print(f"\n{'ALL PASS' if not FAILS else str(len(FAILS)) + ' FAILED: ' + ', '.join(FAILS)}")
 sys.exit(0 if not FAILS else 1)

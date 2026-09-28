@@ -39,6 +39,7 @@ leave old source in place.
 from __future__ import annotations
 
 import argparse
+import re
 import shutil
 import subprocess
 import sys
@@ -78,19 +79,35 @@ def _drop_stale_bytecode(repo, paths):
         shutil.rmtree(pc, ignore_errors=True)
 
 
+_TEST_DIRS = {"test", "tests", "__tests__", "spec", "specs", "testdata", "e2e"}
+_TEST_PREFIXES = ("test_", "test-", "conftest.py", "pytest.ini", "jest.", "vitest.",
+                  "karma.conf.", ".mocharc", "playwright.config.", "cypress.config.",
+                  "phpunit.xml", "setuptests.")
+_TEST_INFIXES = ("_test.", ".test.", "_spec.", ".spec.", "_unittest.")
+# JUnit, xUnit, Spock, XCTest, PHPUnit: FooTest.java, FooTests.cs, FooSpec.groovy, FooIT.java.
+# Case-sensitive, so Latest.java and Contest.java stay source.
+_TEST_CLASS = re.compile(r"[a-z0-9](Tests?|Spec|IT)\.(java|kt|kts|scala|groovy|cs|swift|php|m|mm)$")
+
+
 def classify(paths):
     """Split a commit's files into (source, tests). A path is a TEST if any component
     looks like one -- `tests/`, `test_x.py`, `x_test.go`, `spec/`. Deliberately generous:
     misfiling a test as source would revert it and destroy the check's meaning, while
-    misfiling source as a test only makes the check weaker and visible."""
+    misfiling source as a test only makes the check weaker and visible.
+
+    That asymmetry was not honoured for most runners: `x.spec.ts`, `__tests__/`, `test/`,
+    `FooTest.java` and `conftest.py` were all SOURCE, and reverted. A fixture added to
+    conftest.py with the fix then vanished against the parent, the new test errored for want
+    of it, and the error counted as red: DISCRIMINATES for a docstring-only change. Test
+    infrastructure travels with the tests. Measured 2026-09-28."""
     src, tests = [], []
     for p in paths:
-        low = p.lower()
-        parts = low.split("/")
-        name = parts[-1]
-        is_test = ("tests" in parts or "spec" in parts or name.startswith("test_")
-                   or name.startswith("test-") or "_test." in name or ".test." in name
-                   or name.endswith("_spec.py"))
+        parts = p.split("/")
+        low = [c.lower() for c in parts]
+        name = low[-1]
+        is_test = (any(c in _TEST_DIRS for c in low) or name.startswith(_TEST_PREFIXES)
+                   or any(s in name for s in _TEST_INFIXES)
+                   or bool(_TEST_CLASS.search(parts[-1])))
         (tests if is_test else src).append(p)
     return src, tests
 
