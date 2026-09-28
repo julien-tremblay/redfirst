@@ -352,5 +352,20 @@ check("modes and symlinks come back as they were" + (f" -- {[l for l in left if 
       len([l for l in left if l]), 0)
 shutil.rmtree(r, ignore_errors=True)
 
+# 22. An uncaught exception exits 1, and 1 is DOES NOT DISCRIMINATE: a crash read as a verdict
+#     that a test is worthless. A filename that is not UTF-8 -- legacy Latin-1, legal on Linux --
+#     crashed decoding git's output. Whatever breaks, the exit code must say "no verdict".
+r = mkrepo("def add(a,b):\n    return a - b\n", "def add(a,b):\n    return a + b\n", TEST)
+try:
+    with open(os.fsencode(str(r / "src")) + b"/mod\xe8le.py", "w") as fh:
+        fh.write("X = 1\n")
+except OSError:
+    print("  [SKIP] this filesystem refuses non-UTF-8 names")
+else:
+    (r / "src/m.py").write_text("def add(a,b):\n    return a + b + 0\n")
+    gitq(r, "add", "-A"); gitq(r, "commit", "-qm", "latin-1 name")
+    check("a crash exits 2, not the DOES NOT DISCRIMINATE code", run_rf(r), 2)
+shutil.rmtree(r, ignore_errors=True)
+
 print(f"\n{'ALL PASS' if not FAILS else str(len(FAILS)) + ' FAILED: ' + ', '.join(FAILS)}")
 sys.exit(0 if not FAILS else 1)

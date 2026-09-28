@@ -49,6 +49,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import traceback
 from pathlib import Path
 
 
@@ -406,4 +407,13 @@ def _run(args, repo, target, sub):
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except Exception:
+        # An uncaught exception exits 1, and 1 is DOES NOT DISCRIMINATE: a submodule, a
+        # --source directory and a non-UTF-8 filename each crashed with a traceback that CI
+        # read as "this test proves nothing". Measured 2026-09-28. A crash is not a verdict.
+        traceback.print_exc()
+        print("\nredfirst crashed; that is not a verdict. Exit 2: could not run the check.",
+              file=sys.stderr)
+        sys.exit(2)
