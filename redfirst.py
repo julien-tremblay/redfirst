@@ -45,6 +45,7 @@ import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -67,6 +68,35 @@ def _is_file(repo, rev, path):
     r = subprocess.run(["git", "-C", repo, "cat-file", "-t", f"{rev}:{path}"],
                        capture_output=True, text=True)
     return r.stdout.strip() == "blob"
+
+
+def _save(fp):
+    """A file as it is on disk: its bytes and permission bits, or a symlink's target; None
+    if absent. Bytes alone were not enough. write_bytes() keeps the mode of whatever is
+    there, so a script the commit made executable came back without +x; and exists()
+    follows links, so a dangling symlink read as absent and the restore deleted it.
+    Measured 2026-09-28."""
+    try:
+        st = fp.lstat()
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(st.st_mode):
+        return ("link", os.readlink(fp))
+    return ("file", fp.read_bytes(), stat.S_IMODE(st.st_mode))
+
+
+def _put_back(fp, saved):
+    # Never write THROUGH a link, and never leave a link where a file was or the reverse.
+    if fp.is_symlink() or (fp.exists() and (saved is None or saved[0] == "link")):
+        fp.unlink()
+    if saved is None:
+        return
+    fp.parent.mkdir(parents=True, exist_ok=True)
+    if saved[0] == "link":
+        os.symlink(saved[1], fp)
+    else:
+        fp.write_bytes(saved[1])
+        os.chmod(fp, saved[2])
 
 
 def _drop_stale_bytecode(repo, paths):
@@ -313,10 +343,7 @@ def _run(args, repo, target, sub):
     # Taken before the BASELINE and not after it: a --test command that rewrites source (a
     # formatter in the suite) would otherwise be snapshotted in its rewritten state and
     # "restored" to it, under a message promising the pre-run contents.
-    snapshot = {}
-    for f in src:
-        fp = Path(repo) / f
-        snapshot[f] = fp.read_bytes() if fp.exists() else None
+    snapshot = {f: _save(Path(repo) / f) for f in src}
 
     print(f"commit   {target[:8]}")
     print(f"source   {', '.join(src)}")
@@ -358,13 +385,8 @@ def _run(args, repo, target, sub):
         print(f"  source at parent {parent[:8]}^ ({detail}); re-running the SAME test...\n")
         after = subprocess.run(args.test, shell=True, cwd=cwd)
     finally:
-        for f, blob in snapshot.items():
-            fp = Path(repo) / f
-            if blob is None:
-                fp.unlink(missing_ok=True)
-            else:
-                fp.parent.mkdir(parents=True, exist_ok=True)
-                fp.write_bytes(blob)
+        for f, saved in snapshot.items():
+            _put_back(Path(repo) / f, saved)
         # And again after. The reverted run compiled the PARENT's source, and the file just
         # restored has the same size and, usually, the same whole-second mtime -- so that
         # bytecode is a valid cache for it and the user's next test run executes the old

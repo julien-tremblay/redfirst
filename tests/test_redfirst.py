@@ -335,5 +335,22 @@ check("SIGKILL mid-run leaves nothing staged",
       int(gitq(r, "diff", "--cached", "--name-only").stdout.strip() == ""), 1)
 shutil.rmtree(r, ignore_errors=True)
 
+# 21. "Restores the exact bytes it found" -- but not what else it found. write_bytes() kept the
+#     mode of whatever was there, so a script the commit made executable, or added executable,
+#     came back without +x; and exists() follows links, so a dangling symlink read as absent
+#     and the restore deleted it. The tree must be exactly as it was.
+r = mkrepo("def add(a,b):\n    return a - b\n", "def add(a,b):\n    return a + b\n", TEST)
+(r / "run.sh").write_text("#!/bin/sh\n"); gitq(r, "add", "-A"); gitq(r, "commit", "-qm", "run.sh")
+(r / "run.sh").write_text("#!/bin/sh\necho run\n"); (r / "run.sh").chmod(0o755)
+(r / "tool.sh").write_text("#!/bin/sh\n"); (r / "tool.sh").chmod(0o755)
+(r / "src/m.py").write_text("def add(a,b):\n    return a + b + 0\n")
+import os; os.symlink("../generated/cfg.py", r / "src/cfg.py")
+gitq(r, "add", "-A"); gitq(r, "commit", "-qm", "modes and links")
+run_rf(r)
+left = gitq(r, "status", "--porcelain", "--untracked-files=no").stdout.split("\n")
+check("modes and symlinks come back as they were" + (f" -- {[l for l in left if l]}" if any(left) else ""),
+      len([l for l in left if l]), 0)
+shutil.rmtree(r, ignore_errors=True)
+
 print(f"\n{'ALL PASS' if not FAILS else str(len(FAILS)) + ' FAILED: ' + ', '.join(FAILS)}")
 sys.exit(0 if not FAILS else 1)
