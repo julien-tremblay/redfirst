@@ -190,12 +190,27 @@ def _run(args, repo, target):
         return 2
 
     # A throwaway worktree is clean by construction and holds nothing of the user's.
-    dirty = [] if args.worktree else [
-        ln[3:] for ln in git(["status", "--porcelain", "-z"], repo).split("\0") if ln]
-    clash = sorted(set(dirty) & set(src))
+    dirty = set()
+    if not args.worktree:
+        # With -z a rename's ORIGINAL path is a field of its own with no status prefix, and
+        # slicing it like the others cut three characters off it: a staged `git mv` of a
+        # file this reverts was never seen.
+        fields = iter(git(["status", "--porcelain", "-z"], repo).split("\0"))
+        for ln in fields:
+            if ln:
+                dirty.add(ln[3:])
+                if "R" in ln[:2] or "C" in ln[:2]:
+                    dirty.add(next(fields, ""))
+    # The commit's TESTS must be as it shipped them too, not only its source. In place they
+    # come from the working tree, so an uncommitted edit to the commit's own test -- the
+    # negative case you are writing right now -- was credited to the commit: DISCRIMINATES
+    # about a test that, as committed, passed against its parent. The same false green as a
+    # non-HEAD commit run in place, by the other door. Measured 2026-09-28.
+    clash = sorted(dirty & (set(src) | set(tests)))
     if clash:
-        print("REFUSED: uncommitted changes in the files this would revert; commit or "
-              "stash them first so an interrupted run cannot lose them:", file=sys.stderr)
+        print("REFUSED: uncommitted changes in files this commit touched. The source would be "
+              "overwritten, and the tests that run must be the ones it shipped; commit or "
+              "stash them first, or use --worktree:", file=sys.stderr)
         for c in clash:
             print(f"    {c}", file=sys.stderr)
         return 2

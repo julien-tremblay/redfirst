@@ -181,5 +181,33 @@ run_rf(r)
 check("no bytecode from the reverted run survives it", len(list((r / "src").rglob("*.pyc"))), 0)
 shutil.rmtree(r, ignore_errors=True)
 
+# 11. THE SAME FALSE GREEN AS 5, AT HEAD. In place the tests come from the working tree, so an
+#     uncommitted edit to the commit's own test -- the negative case being written right now --
+#     was credited to the commit. HEAD shipped a tautological test; the tool said DISCRIMINATES.
+r = mkrepo("def is_admin(u):\n    return True\n", "def is_admin(u):\n    return True\n",
+           "def test_placeholder():\n    pass\n")
+(r / "src/m.py").write_text("def is_admin(u):\n    return u.get('role')=='admin'\n")
+(r / "tests/test_m.py").write_text(
+    "from src.m import is_admin\ndef test_yes():\n    assert is_admin({'role':'admin'})\n")
+gitq(r, "commit", "-qam", "fix + a test that cannot fail")
+(r / "tests/test_m.py").write_text((r / "tests/test_m.py").read_text() +
+    "def test_no():\n    assert not is_admin({'role':'guest'})\n")
+out = subprocess.run([sys.executable, str(RF), "HEAD", "--test", CMD, "--repo", str(r)],
+                     capture_output=True, text=True)
+check("an uncommitted edit to the commit's own test is refused",
+      int(out.returncode == 2 and "tests/test_m.py" in out.stderr), 1)
+shutil.rmtree(r, ignore_errors=True)
+
+# 12. With -z, a rename's ORIGINAL path arrives as a field of its own with no status prefix.
+#     Slicing it like the others cut three characters off, so a staged `git mv` of a file this
+#     would revert was never seen as uncommitted work.
+r = mkrepo("def add(a,b):\n    return a - b\n", "def add(a,b):\n    return a + b\n", TEST)
+gitq(r, "mv", "src/m.py", "src/m2.py")
+out = subprocess.run([sys.executable, str(RF), "HEAD", "--test", "true", "--repo", str(r)],
+                     capture_output=True, text=True)
+check("a staged rename of a file it would revert is refused",
+      int(out.returncode == 2 and "src/m.py" in out.stderr), 1)
+shutil.rmtree(r, ignore_errors=True)
+
 print(f"\n{'ALL PASS' if not FAILS else str(len(FAILS)) + ' FAILED: ' + ', '.join(FAILS)}")
 sys.exit(0 if not FAILS else 1)
