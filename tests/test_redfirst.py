@@ -209,5 +209,42 @@ check("a staged rename of a file it would revert is refused",
       int(out.returncode == 2 and "src/m.py" in out.stderr), 1)
 shutil.rmtree(r, ignore_errors=True)
 
+# 13. `git show` detects renames and lists only the NEW path. A commit that moved util.py to
+#     helpers.py (and touched nothing that matters) was "reverted" by deleting helpers.py
+#     without putting util.py back, so everything importing it went red for a reason the
+#     commit never introduced: DISCRIMINATES about a test that passes against the parent.
+r = mkrepo("def add(a,b):\n    return a + b\n", "def add(a,b):\n    return a + b\n", SMOKE)
+(r / "src/util.py").write_text("def two():\n    return 2\n")
+(r / "src/core.py").write_text("from src.util import two\ndef f():\n    return two()\n")
+(r / "tests/test_core.py").write_text("from src.core import f\ndef test_f():\n    assert f() in (2, 3)\n")
+gitq(r, "add", "-A"); gitq(r, "commit", "-qm", "core")
+gitq(r, "mv", "src/util.py", "src/helpers.py")
+(r / "src/core.py").write_text("from src.helpers import two\ndef f():\n    return two()\n")
+gitq(r, "commit", "-qam", "refactor: rename util to helpers")
+got = subprocess.run([sys.executable, str(RF), "HEAD", "--test",
+                      "python3 -m pytest tests/test_core.py -q", "--repo", str(r)],
+                     capture_output=True, text=True).returncode
+check("a rename is reverted as a rename, not as a deletion", got, 1)
+shutil.rmtree(r, ignore_errors=True)
+
+# 14. A submodule's old code lives in another repository and cannot be reverted from here.
+#     It crashed reading the submodule directory as a file, and a crash exits 1: the code
+#     for DOES NOT DISCRIMINATE.
+lib = pathlib.Path(tempfile.mkdtemp())
+gitq(lib, "init", "-q", "."); gitq(lib, "config", "user.email", "t@t"); gitq(lib, "config", "user.name", "t")
+(lib / "v.py").write_text("V = 1\n"); gitq(lib, "add", "-A"); gitq(lib, "commit", "-qm", "v1")
+r = mkrepo("def add(a,b):\n    return a - b\n", "def add(a,b):\n    return a + b\n", TEST)
+gitq(r, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(lib), "vendor/lib")
+gitq(r, "commit", "-qm", "vendor lib")
+(lib / "v.py").write_text("V = 2\n"); gitq(lib, "commit", "-qam", "v2")
+gitq(r / "vendor/lib", "pull", "-q", "origin", "HEAD")
+(r / "src/m.py").write_text("def add(a,b):\n    return a + b + 0\n")
+gitq(r, "commit", "-qam", "bump lib and touch source")
+out = subprocess.run([sys.executable, str(RF), "HEAD", "--test", CMD, "--repo", str(r)],
+                     capture_output=True, text=True)
+check("a commit that moves a submodule is refused, by name",
+      int(out.returncode == 2 and "vendor/lib" in out.stderr and "submodule" in out.stderr), 1)
+shutil.rmtree(r, ignore_errors=True); shutil.rmtree(lib, ignore_errors=True)
+
 print(f"\n{'ALL PASS' if not FAILS else str(len(FAILS)) + ' FAILED: ' + ', '.join(FAILS)}")
 sys.exit(0 if not FAILS else 1)

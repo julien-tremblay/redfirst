@@ -166,8 +166,18 @@ def _run(args, repo, target):
     # no file, so the revert silently did nothing and a correct fix with a correct test was
     # reported DOES NOT DISCRIMINATE -- a false negative that tells you a good test is
     # worthless. Measured 2026-09-02. Paths with spaces were never affected; accents are.
-    files = [f for f in git(["show", "--name-only", "--format=", "-z", target],
-                            repo).split("\0") if f]
+    # Plumbing with --no-renames, because `git show` detects renames and lists only the NEW
+    # path: a commit that moved util.py to helpers.py was "reverted" by deleting helpers.py
+    # without putting util.py back, so whatever imported it went red for a reason the commit
+    # never introduced -- DISCRIMINATES about a test that passes against the true parent.
+    # Measured 2026-09-28. Raw output, for the modes: 160000 is a submodule.
+    raw = git(["diff-tree", "-r", "-z", "--no-commit-id", "--no-renames", target],
+              repo).split("\0")
+    files, submodules = [], []
+    for meta, path in zip(raw[0::2], raw[1::2]):
+        files.append(path)
+        if "160000" in meta[1:].split()[:2]:
+            submodules.append(path)
     src, tests = classify(files)
     if args.source:
         src = args.source
@@ -183,6 +193,16 @@ def _run(args, repo, target):
             for f in outside:
                 print(f"    {f}", file=sys.stderr)
             return 2
+    moved = [f for f in src if f in submodules]
+    if moved:
+        # It crashed reading the submodule's directory as a file, and a crash exits 1 --
+        # the code for DOES NOT DISCRIMINATE.
+        print(f"REFUSED: {target[:8]} moves a submodule, whose old code lives in another "
+              f"repository and cannot be reverted from this one. Name the files to revert "
+              f"with --source to check the rest:", file=sys.stderr)
+        for f in moved:
+            print(f"    {f}", file=sys.stderr)
+        return 2
     if not src:
         print(f"REFUSED: {target[:8]} touches no source files "
               f"({len(tests)} test file(s)) -- nothing to revert, so there is no "
