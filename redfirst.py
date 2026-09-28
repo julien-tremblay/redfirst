@@ -257,6 +257,11 @@ def _run(args, repo, target):
                 fp.parent.mkdir(parents=True, exist_ok=True)
                 fp.write_bytes(blob)
         git(["restore", "--staged", *src], repo, check=False)
+        # And again after. The reverted run compiled the PARENT's source, and the file just
+        # restored has the same size and, usually, the same whole-second mtime -- so that
+        # bytecode is a valid cache for it and the user's next test run executes the old
+        # code. Measured 2026-09-28: 8 runs in 10 left a correct HEAD failing its own test.
+        _drop_stale_bytecode(repo, src)
         print("\n  source restored to its exact pre-run contents.")
 
     if after.returncode != 0:

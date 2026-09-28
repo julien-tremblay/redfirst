@@ -168,5 +168,18 @@ inside = subprocess.run([sys.executable, str(RF), "HEAD", "--test", CMD, "--repo
 check("--source inside the repo still works", inside.returncode, 0)
 shutil.rmtree(r, ignore_errors=True)
 
+
+# --- 2026-09-28 audit ------------------------------------------------------------------
+
+# 10. The reverted run compiles the PARENT's source into src/__pycache__, and the restore puts
+#     back a file of the same size, usually inside the same whole second -- so that bytecode is
+#     a valid cache for the restored file and the user's NEXT test run executes the old code.
+#     8 runs in 10 left a correct HEAD failing its own test. Nothing the reverted run compiled
+#     may outlive it.
+r = mkrepo("def add(a,b):\n    return a - b\n", "def add(a,b):\n    return a + b\n", TEST)
+run_rf(r)
+check("no bytecode from the reverted run survives it", len(list((r / "src").rglob("*.pyc"))), 0)
+shutil.rmtree(r, ignore_errors=True)
+
 print(f"\n{'ALL PASS' if not FAILS else str(len(FAILS)) + ' FAILED: ' + ', '.join(FAILS)}")
 sys.exit(0 if not FAILS else 1)
