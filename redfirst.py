@@ -12,7 +12,7 @@ holding the plan answers badly; "does the new test fail without the new source?"
 command with a yes/no answer, which is why it transfers to a cheap model, or to CI.
 
   redfirst <commit> --test "pytest path/to/test_x.py -q"
-  redfirst <commit> --test "..." -k some_test_name
+  redfirst <commit> --test "pytest path/to/test_x.py -q -k some_test_name"
   redfirst HEAD --test "..." --repo /path/to/other/repo
 
 Exit 0 = DISCRIMINATES (test went red against the old source). Exit 1 = it did not, which
@@ -32,17 +32,24 @@ correct". For that second question the cheap move is enumeration: list the set t
 currently satisfies the check and ask whether it is the intended set. That, not this, is
 what caught 4e03ab5.
 
-Restoration is unconditional; the working tree is checked for modifications to the affected
-paths first and the run is refused if any exist, so an interrupted run can never silently
-leave old source in place.
+Restoration survives Ctrl-C, SIGTERM and SIGHUP: the run unwinds through it. The working
+tree is checked for modifications to the affected paths first and the run is refused if any
+exist, so an interrupted run cannot lose work. Only SIGKILL can leave old source behind, and
+then as an unstaged change that `git status` shows -- the index is never touched -- and that
+the next run refuses to overwrite.
 """
 from __future__ import annotations
 
 import argparse
+import os
+import re
 import shutil
+import signal
+import stat
 import subprocess
 import sys
 import tempfile
+import traceback
 from pathlib import Path
 
 
@@ -52,6 +59,45 @@ def git(args, repo, check=True):
         print(f"git {' '.join(args)} failed: {r.stderr.strip()}", file=sys.stderr)
         sys.exit(2)
     return r.stdout
+
+
+def _unwind(signum, frame):
+    raise SystemExit(128 + signum)
+
+
+def _is_file(repo, rev, path):
+    r = subprocess.run(["git", "-C", repo, "cat-file", "-t", f"{rev}:{path}"],
+                       capture_output=True, text=True)
+    return r.stdout.strip() == "blob"
+
+
+def _save(fp):
+    """A file as it is on disk: its bytes and permission bits, or a symlink's target; None
+    if absent. Bytes alone were not enough. write_bytes() keeps the mode of whatever is
+    there, so a script the commit made executable came back without +x; and exists()
+    follows links, so a dangling symlink read as absent and the restore deleted it.
+    Measured 2026-09-28."""
+    try:
+        st = fp.lstat()
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(st.st_mode):
+        return ("link", os.readlink(fp))
+    return ("file", fp.read_bytes(), stat.S_IMODE(st.st_mode))
+
+
+def _put_back(fp, saved):
+    # Never write THROUGH a link, and never leave a link where a file was or the reverse.
+    if fp.is_symlink() or (fp.exists() and (saved is None or saved[0] == "link")):
+        fp.unlink()
+    if saved is None:
+        return
+    fp.parent.mkdir(parents=True, exist_ok=True)
+    if saved[0] == "link":
+        os.symlink(saved[1], fp)
+    else:
+        fp.write_bytes(saved[1])
+        os.chmod(fp, saved[2])
 
 
 def _drop_stale_bytecode(repo, paths):
@@ -78,19 +124,35 @@ def _drop_stale_bytecode(repo, paths):
         shutil.rmtree(pc, ignore_errors=True)
 
 
+_TEST_DIRS = {"test", "tests", "__tests__", "spec", "specs", "testdata", "e2e"}
+_TEST_PREFIXES = ("test_", "test-", "conftest.py", "pytest.ini", "jest.", "vitest.",
+                  "karma.conf.", ".mocharc", "playwright.config.", "cypress.config.",
+                  "phpunit.xml", "setuptests.")
+_TEST_INFIXES = ("_test.", ".test.", "_spec.", ".spec.", "_unittest.")
+# JUnit, xUnit, Spock, XCTest, PHPUnit: FooTest.java, FooTests.cs, FooSpec.groovy, FooIT.java.
+# Case-sensitive, so Latest.java and Contest.java stay source.
+_TEST_CLASS = re.compile(r"[a-z0-9](Tests?|Spec|IT)\.(java|kt|kts|scala|groovy|cs|swift|php|m|mm)$")
+
+
 def classify(paths):
     """Split a commit's files into (source, tests). A path is a TEST if any component
     looks like one -- `tests/`, `test_x.py`, `x_test.go`, `spec/`. Deliberately generous:
     misfiling a test as source would revert it and destroy the check's meaning, while
-    misfiling source as a test only makes the check weaker and visible."""
+    misfiling source as a test only makes the check weaker and visible.
+
+    That asymmetry was not honoured for most runners: `x.spec.ts`, `__tests__/`, `test/`,
+    `FooTest.java` and `conftest.py` were all SOURCE, and reverted. A fixture added to
+    conftest.py with the fix then vanished against the parent, the new test errored for want
+    of it, and the error counted as red: DISCRIMINATES for a docstring-only change. Test
+    infrastructure travels with the tests. Measured 2026-09-28."""
     src, tests = [], []
     for p in paths:
-        low = p.lower()
-        parts = low.split("/")
-        name = parts[-1]
-        is_test = ("tests" in parts or "spec" in parts or name.startswith("test_")
-                   or name.startswith("test-") or "_test." in name or ".test." in name
-                   or name.endswith("_spec.py"))
+        parts = p.split("/")
+        low = [c.lower() for c in parts]
+        name = low[-1]
+        is_test = (any(c in _TEST_DIRS for c in low) or name.startswith(_TEST_PREFIXES)
+                   or any(s in name for s in _TEST_INFIXES)
+                   or bool(_TEST_CLASS.search(parts[-1])))
         (tests if is_test else src).append(p)
     return src, tests
 
@@ -100,9 +162,11 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("commit", help="the commit whose test/source pair is being checked")
     ap.add_argument("--test", required=True, help="command that runs the test(s)")
-    ap.add_argument("--repo", default=".", help="repository root (default: cwd)")
+    ap.add_argument("--repo", default=".",
+                    help="where to run the test command: the repository or any directory "
+                         "inside it (default: cwd)")
     ap.add_argument("--source", action="append", default=None,
-                    help="explicit source path to revert (repeatable); "
+                    help="explicit source path to revert, relative to --repo (repeatable); "
                          "default: every non-test file the commit touched")
     ap.add_argument("--worktree", action="store_true",
                     help="check the commit out into a throwaway git worktree and run "
@@ -110,7 +174,26 @@ def main() -> int:
                          "your suite must not depend on untracked files (a venv, "
                          "node_modules, a .env).")
     args = ap.parse_args()
-    repo = args.repo
+    # SIGTERM and SIGHUP kill without unwinding, so the `finally` that restores the source
+    # never ran: a CI timeout or a closed terminal during the reverted run left the PARENT's
+    # source in the tree. Measured 2026-09-28. Raise instead, and the restore runs on the way
+    # out.
+    for name in ("SIGTERM", "SIGHUP"):
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), _unwind)
+    # --repo may be any directory inside the repository; a service's own folder in a monorepo
+    # is the ordinary case. Git reports paths from the TOP, so every file operation happens
+    # there and only the test command runs where the user asked. Taking --repo as the top
+    # made `Path(repo) / path` point below the subdirectory at nothing: a commit adding a new
+    # module was "reverted" by deleting a file that did not exist, the test still passed, and
+    # a good test was reported DOES NOT DISCRIMINATE. Measured 2026-09-28.
+    repo = git(["rev-parse", "--show-toplevel"], args.repo).strip()
+    sub = git(["rev-parse", "--show-prefix"], args.repo).strip()
+    if args.source:
+        # Relative to --repo, as a git pathspec would be, and normalised to the top so that
+        # `./src/m.py` names the same file `git status` does.
+        args.source = [Path(os.path.relpath(os.path.join(repo, sub, f), repo)).as_posix()
+                       for f in args.source]
 
     head = git(["rev-parse", "HEAD"], repo).strip()
     rev = subprocess.run(["git", "-C", repo, "rev-parse", "--verify", "--quiet",
@@ -153,21 +236,36 @@ def main() -> int:
         git(["worktree", "add", "--detach", "--quiet", wt, target], origin)
         repo = wt
     try:
-        return _run(args, repo, target)
+        return _run(args, repo, target, sub)
     finally:
         if tmp:
             git(["worktree", "remove", "--force", str(Path(tmp) / "wt")], origin, check=False)
             shutil.rmtree(tmp, ignore_errors=True)
 
 
-def _run(args, repo, target):
+def _run(args, repo, target, sub):
+    cwd = Path(repo) / sub
+    if not cwd.is_dir():
+        print(f"REFUSED: {sub} does not exist at {target[:8]}, so the test command has "
+              f"nowhere to run.", file=sys.stderr)
+        return 2
     # -z, because without it git QUOTES any path outside ASCII: `src/modèle.py` comes back
     # as the literal 12-character-escaped string "src/mod\303\250le.py". That string names
     # no file, so the revert silently did nothing and a correct fix with a correct test was
     # reported DOES NOT DISCRIMINATE -- a false negative that tells you a good test is
     # worthless. Measured 2026-09-02. Paths with spaces were never affected; accents are.
-    files = [f for f in git(["show", "--name-only", "--format=", "-z", target],
-                            repo).split("\0") if f]
+    # Plumbing with --no-renames, because `git show` detects renames and lists only the NEW
+    # path: a commit that moved util.py to helpers.py was "reverted" by deleting helpers.py
+    # without putting util.py back, so whatever imported it went red for a reason the commit
+    # never introduced -- DISCRIMINATES about a test that passes against the true parent.
+    # Measured 2026-09-28. Raw output, for the modes: 160000 is a submodule.
+    raw = git(["diff-tree", "-r", "-z", "--no-commit-id", "--no-renames", target],
+              repo).split("\0")
+    files, submodules = [], []
+    for meta, path in zip(raw[0::2], raw[1::2]):
+        files.append(path)
+        if "160000" in meta[1:].split()[:2]:
+            submodules.append(path)
     src, tests = classify(files)
     if args.source:
         src = args.source
@@ -183,6 +281,28 @@ def _run(args, repo, target):
             for f in outside:
                 print(f"    {f}", file=sys.stderr)
             return 2
+        # One that is a file in neither the commit nor its parent has nothing to revert. It
+        # was taken for a file the commit ADDED and "reverted" by deleting it, so a typo
+        # reverted nothing, the test passed, and a good test was reported DOES NOT
+        # DISCRIMINATE; a directory crashed, which exits 1 -- the same verdict.
+        unknown = [f for f in src if f not in submodules and not any(
+            _is_file(repo, rev, f) for rev in (target, f"{target}^"))]
+        if unknown:
+            print(f"REFUSED: --source must name a file at {target[:8]} or its parent; "
+                  f"these are neither:", file=sys.stderr)
+            for f in unknown:
+                print(f"    {f}", file=sys.stderr)
+            return 2
+    moved = [f for f in src if f in submodules]
+    if moved:
+        # It crashed reading the submodule's directory as a file, and a crash exits 1 --
+        # the code for DOES NOT DISCRIMINATE.
+        print(f"REFUSED: {target[:8]} moves a submodule, whose old code lives in another "
+              f"repository and cannot be reverted from this one. Name the files to revert "
+              f"with --source to check the rest:", file=sys.stderr)
+        for f in moved:
+            print(f"    {f}", file=sys.stderr)
+        return 2
     if not src:
         print(f"REFUSED: {target[:8]} touches no source files "
               f"({len(tests)} test file(s)) -- nothing to revert, so there is no "
@@ -190,12 +310,27 @@ def _run(args, repo, target):
         return 2
 
     # A throwaway worktree is clean by construction and holds nothing of the user's.
-    dirty = [] if args.worktree else [
-        ln[3:] for ln in git(["status", "--porcelain", "-z"], repo).split("\0") if ln]
-    clash = sorted(set(dirty) & set(src))
+    dirty = set()
+    if not args.worktree:
+        # With -z a rename's ORIGINAL path is a field of its own with no status prefix, and
+        # slicing it like the others cut three characters off it: a staged `git mv` of a
+        # file this reverts was never seen.
+        fields = iter(git(["status", "--porcelain", "-z"], repo).split("\0"))
+        for ln in fields:
+            if ln:
+                dirty.add(ln[3:])
+                if "R" in ln[:2] or "C" in ln[:2]:
+                    dirty.add(next(fields, ""))
+    # The commit's TESTS must be as it shipped them too, not only its source. In place they
+    # come from the working tree, so an uncommitted edit to the commit's own test -- the
+    # negative case you are writing right now -- was credited to the commit: DISCRIMINATES
+    # about a test that, as committed, passed against its parent. The same false green as a
+    # non-HEAD commit run in place, by the other door. Measured 2026-09-28.
+    clash = sorted(dirty & (set(src) | set(tests)))
     if clash:
-        print("REFUSED: uncommitted changes in the files this would revert; commit or "
-              "stash them first so an interrupted run cannot lose them:", file=sys.stderr)
+        print("REFUSED: uncommitted changes in files this commit touched. The source would be "
+              "overwritten, and the tests that run must be the ones it shipped; commit or "
+              "stash them first, or use --worktree:", file=sys.stderr)
         for c in clash:
             print(f"    {c}", file=sys.stderr)
         return 2
@@ -209,17 +344,18 @@ def _run(args, repo, target):
     # Taken before the BASELINE and not after it: a --test command that rewrites source (a
     # formatter in the suite) would otherwise be snapshotted in its rewritten state and
     # "restored" to it, under a message promising the pre-run contents.
-    snapshot = {}
-    for f in src:
-        fp = Path(repo) / f
-        snapshot[f] = fp.read_bytes() if fp.exists() else None
+    snapshot = {f: _save(Path(repo) / f) for f in src}
 
     print(f"commit   {target[:8]}")
     print(f"source   {', '.join(src)}")
     print(f"tests    {', '.join(tests) or '(none in this commit)'}")
     print(f"running  {args.test}\n")
 
-    before = subprocess.run(args.test, shell=True, cwd=repo)
+    # Flushed before every run: piped, as in any CI log, stdout is block-buffered while the
+    # test writes straight to the descriptor, and both runs' output landed above the header
+    # that says which run is which. Measured 2026-09-28.
+    sys.stdout.flush()
+    before = subprocess.run(args.test, shell=True, cwd=cwd)
     if before.returncode != 0:
         print(f"\nREFUSED: the test command already fails at {target[:8]} "
               f"(exit {before.returncode}). Fix that first -- a check that starts red "
@@ -239,7 +375,12 @@ def _run(args, repo, target):
     added = [f for f in src if f not in in_parent]
     try:
         if in_parent:
-            git(["checkout", parent, "--", *in_parent], repo)
+            # The WORKING TREE only, never the index. `git checkout <parent> -- src` also
+            # STAGED the parent's source, and the `git restore --staged` that undid it ran only
+            # if the run got that far and every path matched; SIGKILL skipped it outright.
+            # The old source then sat in the index under "source restored", for the next
+            # `git commit` to ship. Measured 2026-09-28.
+            git(["restore", "--source", parent, "--worktree", "--", *in_parent], repo)
         for f in added:
             (Path(repo) / f).unlink(missing_ok=True)
         _drop_stale_bytecode(repo, src)
@@ -247,16 +388,16 @@ def _run(args, repo, target):
         if added:
             detail += f", {len(added)} deleted (added by this commit)"
         print(f"  source at parent {parent[:8]}^ ({detail}); re-running the SAME test...\n")
-        after = subprocess.run(args.test, shell=True, cwd=repo)
+        sys.stdout.flush()
+        after = subprocess.run(args.test, shell=True, cwd=cwd)
     finally:
-        for f, blob in snapshot.items():
-            fp = Path(repo) / f
-            if blob is None:
-                fp.unlink(missing_ok=True)
-            else:
-                fp.parent.mkdir(parents=True, exist_ok=True)
-                fp.write_bytes(blob)
-        git(["restore", "--staged", *src], repo, check=False)
+        for f, saved in snapshot.items():
+            _put_back(Path(repo) / f, saved)
+        # And again after. The reverted run compiled the PARENT's source, and the file just
+        # restored has the same size and, usually, the same whole-second mtime -- so that
+        # bytecode is a valid cache for it and the user's next test run executes the old
+        # code. Measured 2026-09-28: 8 runs in 10 left a correct HEAD failing its own test.
+        _drop_stale_bytecode(repo, src)
         print("\n  source restored to its exact pre-run contents.")
 
     if after.returncode != 0:
@@ -271,4 +412,13 @@ def _run(args, repo, target):
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except Exception:
+        # An uncaught exception exits 1, and 1 is DOES NOT DISCRIMINATE: a submodule, a
+        # --source directory and a non-UTF-8 filename each crashed with a traceback that CI
+        # read as "this test proves nothing". Measured 2026-09-28. A crash is not a verdict.
+        traceback.print_exc()
+        print("\nredfirst crashed; that is not a verdict. Exit 2: could not run the check.",
+              file=sys.stderr)
+        sys.exit(2)

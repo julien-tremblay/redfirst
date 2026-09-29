@@ -12,20 +12,31 @@ re-runs your test command. If the test does not go red, it proves nothing about 
 
 ```
 $ redfirst HEAD --test "pytest tests/test_parser.py -q"
-
-commit   HEAD
+commit   afef45df
 source   src/parser.py
 tests    tests/test_parser.py
+running  pytest tests/test_parser.py -q
+
+1 passed in 0.01s
 
   baseline: test passes at this commit, as expected.
-  reverted source to HEAD^; re-running the SAME test...
+
+  source at parent afef45df^ (1 reverted); re-running the SAME test...
+
+FAILED tests/test_parser.py::test_strips - AssertionError: assert ['a', ' b']...
+1 failed in 0.01s
+
   source restored to its exact pre-run contents.
 
-DISCRIMINATES: the test went RED against HEAD^ (exit 1) and passes with the change.
+DISCRIMINATES: the test went RED against afef45df^ (exit 1) and passes with the change. It tests the change.
 ```
 
 Exit `0` discriminates, `1` does not, `2` could not run the check. Drop it in CI or a
 pre-push hook.
+
+`--repo` (default: the current directory) may be any directory inside the repository, such
+as one service's folder in a monorepo. The test command runs there; the files are reverted
+wherever they are.
 
 ## Auditing an older commit
 
@@ -78,24 +89,36 @@ Works with any test runner: it just runs the shell command you give it.
 
 - **`--source` may not escape the repository.** Those paths are used to unlink and rewrite
   files, and a run killed between the two loses whatever they named.
-- **It refuses to run on a dirty tree** when your uncommitted changes overlap the files it
-  would revert, so an interrupted run cannot lose work.
-- **It restores the exact bytes it found**, not the commit's version. Restoring with
-  `git checkout <commit> -- src` was the first implementation and it corrupted a working
-  tree in real use, silently undoing a fix committed an hour earlier.
+- **It refuses to run on a dirty tree** when your uncommitted changes overlap the files the
+  commit touched: its source, which it would overwrite, and its tests, which must be the ones
+  it shipped. An uncommitted edit to the commit's own test used to be credited to the commit.
+- **It restores exactly what it found**: bytes, permission bits and symlinks, not the
+  commit's version. Restoring with `git checkout <commit> -- src` was the first
+  implementation and it corrupted a working tree in real use, silently undoing a fix
+  committed an hour earlier.
+- **It never touches the index.** The revert writes the working tree only, so no
+  interruption can leave the parent's source staged for your next commit. Ctrl-C, SIGTERM
+  and SIGHUP unwind through the restore; SIGKILL cannot, and leaves an unstaged change that
+  the next run refuses to overwrite.
 - **It never reverts test files.** New tests against old source is the entire trick.
 - **It handles a commit that adds a new file.** The parent's state for such a file is its
   absence, so it is deleted rather than checked out. `git checkout <parent> -- <new file>`
   fails outright, which used to make the most ordinary commit of all (a new module plus its
-  first test) impossible to check.
+  first test) impossible to check. A renamed file is reverted as a rename: both halves.
 - **It snapshots before anything runs**, so a `--test` command that rewrites source (a
   formatter inside the suite) is still restored to what you actually had.
 - **It refuses what it cannot answer**: a merge commit (`git show` reports no files for
-  one), a root commit (no parent to revert to), and an unknown revision each exit 2 with a
-  specific reason rather than a verdict or a raw git error.
-- **It clears compiled bytecode between runs.** CPython validates a `.pyc` by source mtime
-  in whole seconds plus size, so a same-size edit reverted and re-run inside one second
-  reuses stale bytecode. Without this the tool reported a correct test as proving nothing.
+  one), a root commit (no parent to revert to), a commit that moves a submodule (its old
+  code is in another repository), a `--source` that names no file at the commit or its
+  parent, and an unknown revision each exit 2 with a specific reason rather than a verdict
+  or a raw git error.
+- **A crash exits 2, never 1.** Python exits 1 on an uncaught exception, and 1 means DOES
+  NOT DISCRIMINATE; a crash used to read as a verdict.
+- **It clears compiled bytecode before the reverted run and after the restore.** CPython
+  validates a `.pyc` by source mtime in whole seconds plus size, so a same-size edit
+  reverted and re-run inside one second reuses stale bytecode. Without the first, the tool
+  reported a correct test as proving nothing; without the second, your own next test run
+  executed the parent's code.
 
 ## Known blind spot
 
@@ -158,7 +181,7 @@ pip install pytest
 python3 tests/test_redfirst.py
 ```
 
-Offline, about twenty seconds. Every case is a defect that actually shipped. This is what CI
+Offline, about fifteen seconds. Every case is a defect that actually shipped. This is what CI
 runs on every push, on Python 3.9 and 3.12.
 
 ## License
